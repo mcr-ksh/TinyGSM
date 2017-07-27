@@ -72,7 +72,7 @@ public:
     TINY_GSM_YIELD();
     rx.clear();
     uint8_t newMux = -1;
-    sock_connected = at->modemConnect(host, port, &newMux);
+    sock_connected = (at->modemConnect(host, port, &newMux) == 1);
     if (sock_connected) {
       mux = newMux;
       at->sockets[mux] = this;
@@ -94,9 +94,15 @@ public:
 
   virtual void stop() {
     TINY_GSM_YIELD();
-    at->sendAT(GF("+CIPCLOSE="), mux);
-    sock_connected = false;
-    at->waitResponse();
+    if ( connected() || sock_connected ) {
+      at->sendAT(GF("+CIPCLOSE="), mux);
+      sock_connected = false;
+      at->waitResponse();
+    } else {
+      DBG("stop(): not connected");
+      sock_connected = false;
+      at->sockets[mux] = false;
+    }
   }
 
   virtual size_t write(const uint8_t *buf, size_t size) {
@@ -111,7 +117,8 @@ public:
 
   virtual int available() {
     TINY_GSM_YIELD();
-    if (!rx.size()) {
+    if (!rx.size() && sock_connected) {
+      DBG("available(): maintain rx.size(): ", rx.size());
       at->maintain();
     }
     return rx.size();
@@ -129,9 +136,15 @@ public:
         continue;
       }
       // TODO: Read directly into user buffer?
+      DBG("read(): pre- rx.size() && connected() =", connected());
+      if (!connected()) {
+	DBG("read(): connection broken");
+	break;
+      }
       if (!rx.size()) {
+	DBG("read(): maintain available = ", available());
         at->maintain();
-        //break;
+        break;
       }
     }
     return cnt;
@@ -149,6 +162,7 @@ public:
   virtual void flush() { at->stream.flush(); }
 
   virtual uint8_t connected() {
+    DBG("connected(): -->");
     if (available()) {
       return true;
     }
@@ -200,7 +214,7 @@ public:
 
   void maintain() {
     //while (stream.available()) {
-      waitResponse(10, NULL, NULL);
+      waitResponse(60000L, NULL, NULL);
     //}
   }
 
@@ -318,6 +332,7 @@ public:
     }
     streamSkipUntil(','); // Skip format (0)
     int status = stream.readStringUntil('\n').toInt();
+    DBG("getRegistrationStatus():", status);
     waitResponse();
     return (RegStatus)status;
   }
@@ -333,7 +348,7 @@ public:
     return res;
   }
 
-  bool waitForNetwork(unsigned long timeout = 60000L) {
+  bool waitForNetwork(unsigned long timeout = 120000L) {
     for (unsigned long start = millis(); millis() - start < timeout; ) {
       RegStatus s = getRegistrationStatus();
       if (s == REG_OK_HOME || s == REG_OK_ROAMING) {
@@ -413,89 +428,26 @@ public:
    * Battery functions
    */
 
-private:
-  int modemConnect(const char* host, uint16_t port, uint8_t* mux) {
-    sendAT(GF("+CIPSTART="),  GF("\"TCP"), GF("\",\""), host, GF("\","), port);
-
-    if (waitResponse(75000L, GF(GSM_NL "+CIPNUM:")) != 1) {
-      return -1;
-    }
-    int newMux = stream.readStringUntil('\n').toInt();
-
-    int rsp = waitResponse(75000L,
-                           GF("CONNECT OK" GSM_NL),
-                           GF("CONNECT FAIL" GSM_NL),
-                           GF("ALREADY CONNECT" GSM_NL));
-    if (waitResponse() != 1) {
-      return -1;
-    }
-    *mux = newMux;
-
-    return (1 == rsp);
-  }
-
-  int modemSend(const void* buff, size_t len, uint8_t mux) {
-    sendAT(GF("+CIPSEND="), mux, ',', len);
-    if (waitResponse(10000L, GF(GSM_NL ">")) != 1) {
-      return -1;
-    }
-    stream.write((uint8_t*)buff, len);
-    stream.flush();
-    if (waitResponse(10000L, GFP(GSM_OK), GF(GSM_NL "FAIL")) != 1) {
-      return -1;
-    }
-    return len;
-  }
-
-  bool modemGetConnected(uint8_t mux) { //TODO mux?
-    sendAT(GF("+CIPSTATUS"));
-    int res = waitResponse(GF(",\"CONNECTED\""), GF(",\"CLOSED\""), GF(",\"CLOSING\""), GF(",\"INITIAL\""));
-    waitResponse();
-    return 1 == res;
-  }
-
-  /* Utilities */
-  template<typename T>
-  void streamWrite(T last) {
-    stream.print(last);
-  }
-
-  template<typename T, typename... Args>
-  void streamWrite(T head, Args... tail) {
-    stream.print(head);
-    streamWrite(tail...);
-  }
-
-  int streamRead() { return stream.read(); }
-
-  bool streamSkipUntil(char c) { //TODO: timeout
-    while (true) {
-      while (!stream.available()) {}
-      if (stream.read() == c)
-        return true;
-    }
-    return false;
-  }
-
   template<typename... Args>
   void sendAT(Args... cmd) {
     streamWrite("AT", cmd..., GSM_NL);
     stream.flush();
     TINY_GSM_YIELD();
-    //DBG("### AT:", cmd...);
+    DBG("### sendAT():", cmd...);
   }
 
   // TODO: Optimize this!
   uint8_t waitResponse(uint32_t timeout, String& data,
                        GsmConstStr r1=GFP(GSM_OK), GsmConstStr r2=GFP(GSM_ERROR),
                        GsmConstStr r3=NULL, GsmConstStr r4=NULL, GsmConstStr r5=NULL)
-  {
-    /*String r1s(r1); r1s.trim();
+  { /*
+    String r1s(r1); r1s.trim();
     String r2s(r2); r2s.trim();
     String r3s(r3); r3s.trim();
     String r4s(r4); r4s.trim();
     String r5s(r5); r5s.trim();
-    DBG("### ..:", r1s, ",", r2s, ",", r3s, ",", r4s, ",", r5s);*/
+    DBG("### waitResponse(): params", r1s, ",", r2s, ",", r3s, ",", r4s, ",", r5s);
+    */
     data.reserve(64);
     int index = 0;
     unsigned long startMillis = millis();
@@ -503,7 +455,7 @@ private:
       TINY_GSM_YIELD();
       while (stream.available() > 0) {
         int a = streamRead();
-        if (a <= 0) continue; // Skip 0x00 bytes, just in case
+        //if (a <= 0) continue; // Skip 0x00 bytes, just in case
         data += (char)a;
         if (r1 && data.endsWith(r1)) {
           index = 1;
@@ -532,21 +484,44 @@ private:
             while (!stream.available()) {}
             sockets[mux]->rx.put(stream.read());
           }
-          data = "";
+	  data = "";
           return index;
+	} else if (data.endsWith(GF("+CREG: "))) {
+	  int status = stream.readStringUntil('\n').toInt();
+	  DBG("waitResponse(): getRegistrationStatus =", status);
+	  if ( status != 1 ) {
+	    DBG("waitResponse(): disconnecting all sockets");
+	    for ( int i = 0; i < sizeof(sockets); i ++ )
+	    	sockets[i]->sock_connected = false;
+	  }
         } else if (data.endsWith(GF("+TCPCLOSED:"))) {
-          int mux = stream.readStringUntil(',').toInt();
-          stream.readStringUntil('\n');
+          int mux = stream.readStringUntil('\n').toInt();
+	  DBG("waitResponse(): TCPCLOSED mux =", mux);
           sockets[mux]->sock_connected = false;
-          data = "";
+	  data = "";
+	  // after close OK o ERROR
+	  r1 = GF(GSM_NL "OK");
+	  r2 = GF(GSM_NL "ERROR");
+	  DBG("waitResponse(): available = ", stream.available());
         }
       }
     } while (millis() - startMillis < timeout);
 finish:
+    if ( millis() - startMillis >= timeout )
+    	DBG("### timeout", String(timeout), " runtime ", String(millis() - startMillis));
+    else
+	DBG("### ret", index);
+
     if (!index) {
-      data.trim();
+     data.trim();
       if (data.length()) {
-        DBG("### Unhandled:", data);
+        if (data.endsWith(GF("+TCPCLOSED:"))) {
+	  DBG("waitResponse(): TCPCLOSED2\n");
+	  int mux = stream.readStringUntil('\n').toInt();
+          sockets[mux]->sock_connected = false;
+        } 
+	else 	    
+          DBG("### Unhandled:", data);
       }
       data = "";
     }
@@ -561,10 +536,78 @@ finish:
     return waitResponse(timeout, data, r1, r2, r3, r4, r5);
   }
 
+  // waitResponse(); waitResponse(r1); waitResponse(r1, r2);
   uint8_t waitResponse(GsmConstStr r1=GFP(GSM_OK), GsmConstStr r2=GFP(GSM_ERROR),
                        GsmConstStr r3=NULL, GsmConstStr r4=NULL, GsmConstStr r5=NULL)
   {
-    return waitResponse(1000, r1, r2, r3, r4, r5);
+    return waitResponse(1000L, r1, r2, r3, r4, r5);
+  }
+
+
+private:
+  int modemConnect(const char* host, uint16_t port, uint8_t* mux) {
+    sendAT(GF("+CIPSTART="),  GF("\"TCP"), GF("\",\""), host, GF("\","), port);
+    if (waitResponse(75000L, GF(GSM_NL "+CIPNUM:"), GF(GSM_NL "ERROR")) != 1) {
+      DBG("modemConnect(): Error 1");
+      return -1;
+    }
+    int newMux = stream.readStringUntil('\n').toInt();
+    DBG("modemConnect(): mux =", newMux);
+    int rsp = waitResponse(75000L,
+                           GF("CONNECT OK" GSM_NL),
+                           GF("CONNECT FAIL" GSM_NL),
+                           GF("ALREADY CONNECT" GSM_NL));
+    if (waitResponse() != 1) {
+      DBG("modemConnect(): Error 2");
+      return -1;
+    }
+    *mux = newMux;
+
+    return (1 == rsp);
+  }
+
+  int modemSend(const void* buff, size_t len, uint8_t mux) {
+    sendAT(GF("+CIPSEND="), mux, ',', len);
+    if (waitResponse(10000L, GF(GSM_NL ">")) != 1) {
+      return -1;
+    }
+    stream.write((uint8_t*)buff, len);
+    stream.flush();
+    if (waitResponse(10000L, GFP(GSM_OK), GF(GSM_NL "ERROR")) != 1) {
+      return -1;
+    }
+    return len;
+  }
+
+  bool modemGetConnected(uint8_t mux) { //TODO mux?
+    sendAT(GF("+CIPSTATUS"));
+    int res = waitResponse(GF(",\"CONNECTED\""), GF(",\"CLOSED\""), GF(",\"CLOSING\""), GF(",\"INITIAL\""));
+    waitResponse();
+    return 1 == res;
+  }
+
+  /* Utilities */
+  template<typename T>
+  void streamWrite(T last) {
+    stream.print(last);
+  }
+
+  template<typename T, typename... Args>
+  void streamWrite(T head, Args... tail) {
+    stream.print(head);
+    streamWrite(tail...);
+  }
+
+  int streamRead() { return stream.read(); }
+
+  bool streamSkipUntil(char c) { //TODO: timeout
+    DBG("streamSkipUntil(): c = ", c);
+    while (true) {
+      while (!stream.available()) {}
+      if (stream.read() == c)
+        return true;
+    }
+    return false;
   }
 
 private:
